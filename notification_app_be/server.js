@@ -3,159 +3,161 @@
 require("dotenv").config();
 
 const express = require("express");
-const axios   = require("axios");
-const { setToken, logDebug, logInfo, logWarn, logFatal } =
-  require("../logging_middleware");
+const axios = require("axios");
+const { setToken, logDebug, logInfo, logWarn, logFatal } = require("../logging_middleware");
 
-const app  = express();
+const app = express();
 const PORT = process.env.PORT || 3001;
-const BASE = process.env.BASE_URL || "http://4.224.186.213/evaluation-service";
+const BASE_URL = process.env.BASE_URL || "http://4.224.186.213/evaluation-service";
 
-const CREDENTIALS = {
-  email:        process.env.EMAIL,
-  name:         process.env.NAME,
-  rollNo:       process.env.ROLL_NO,
-  accessCode:   process.env.ACCESS_CODE,
-  clientID:     process.env.CLIENT_ID,
+const API_CREDENTIALS = {
+  email: process.env.EMAIL,
+  name: process.env.NAME,
+  rollNo: process.env.ROLL_NO,
+  accessCode: process.env.ACCESS_CODE,
+  clientID: process.env.CLIENT_ID,
   clientSecret: process.env.CLIENT_SECRET,
 };
 
-let TOKEN = "";
+let activeToken = "";
 
-async function authenticate() {
-  const { data } = await axios.post(`${BASE}/auth`, CREDENTIALS);
-  TOKEN = data.access_token;
-  setToken(TOKEN);
-  await logInfo("auth", "token refreshed");
+// Authenticate and store the access token
+async function establishConnection() {
+  const response = await axios.post(`${BASE_URL}/auth`, API_CREDENTIALS);
+  activeToken = response.data.access_token;
+  setToken(activeToken);
+  await logInfo("auth", "Session token successfully refreshed".slice(0, 48));
 }
 
-function authHeaders() {
-  return { Authorization: `Bearer ${TOKEN}` };
+function getAuthHeader() {
+  return { Authorization: `Bearer ${activeToken}` };
 }
 
-// ═══════════════════════════════════════════════════════════
-//  PRIORITY SCORING ALGORITHM
-//
-//  Real API shape: { ID, Type, Message, Timestamp }
-//  Real types   : Result | Placement | Event
-//
-//  Score = typeWeight + freshness
-//
-//  typeWeight: Result=100, Placement=70, Event=40
-//    Result   — exam results affect student future directly
-//    Placement— hiring alerts are time-sensitive (deadlines)
-//    Event    — college events, lowest urgency
-//
-//  freshness: max(0, 30 − ageInHours)
-//    Decays 1 point per hour over 30 hours.
-//    A brand-new notification scores +30 on top of its type.
-//    Older than 30 hours → +0 bonus.
-//
-//  FINAL SCORE = typeWeight + freshness
-//
-//  WHY NO READ PENALTY?
-//  The API has no `read` field — notifications are anonymous
-//  (no userID either). So we sort purely on type + recency.
-//
-//  COMPLEXITY: O(n) scoring + O(n log n) sort — optimal
-// ═══════════════════════════════════════════════════════════
+// ---------------------------------------------------------
+// Priority Scoring Engine
+// ---------------------------------------------------------
 
-const TYPE_WEIGHT = {
-  "Result":    100,
-  "Placement":  70,
-  "Event":      40,
+const CATEGORY_BASE_SCORES = {
+  Result: 100,
+  Placement: 70,
+  Event: 40,
 };
 
+const MAX_BONUS_HOURS = 30;
+
 /**
- * Score one notification.
- * Timestamp from the API is "YYYY-MM-DD HH:MM:SS" (no timezone).
- * We treat it as UTC by replacing the space with T and appending Z.
+ * Converts the API timestamp into hours elapsed since publication.
  */
-function scoreNotification(n, nowMs) {
-  const weight    = TYPE_WEIGHT[n.Type] ?? 10;
-  const ts        = n.Timestamp.replace(" ", "T") + "Z";
-  const ageHours  = (nowMs - new Date(ts).getTime()) / 3_600_000;
-  const freshness = Math.max(0, 30 - ageHours);
-  return parseFloat((weight + freshness).toFixed(2));
+function calculateHoursPassed(dateString, currentMs) {
+  // Convert "YYYY-MM-DD HH:MM:SS" to valid ISO format
+  const validIsoString = dateString.replace(" ", "T") + "Z";
+  const publishedMs = new Date(validIsoString).getTime();
+  
+  return (currentMs - publishedMs) / (1000 * 60 * 60);
 }
 
 /**
- * Sort all notifications by priority score (highest first).
- * Returns enriched array with priorityScore attached to each item.
+ * Calculates total priority based on alert type and recency.
  */
-function buildPriorityInbox(notifications) {
-  const nowMs = Date.now();
-
-  return notifications
-    .map(n => ({ ...n, priorityScore: scoreNotification(n, nowMs) }))
-    .sort((a, b) => b.priorityScore - a.priorityScore);
+function calculateRelevance(alert, currentMs) {
+  const baseScore = CATEGORY_BASE_SCORES[alert.Type] || 10;
+  const hoursPassed = calculateHoursPassed(alert.Timestamp, currentMs);
+  
+  // Decays 1 point per hour, bottoming out at 0
+  const timeBonus = Math.max(0, MAX_BONUS_HOURS - hoursPassed);
+  
+  return Number((baseScore + timeBonus).toFixed(2));
 }
 
-// ── GET /notifications ─────────────────────────────────────
+/**
+ * Validates, scores, and sorts the alerts in a single pass.
+ */
+function generateRankedFeed(rawAlerts) {
+  const currentMs = Date.now();
+  const processedFeed = [];
+
+  for (const alert of rawAlerts) {
+    // Inline validation checks
+    const isValid = 
+      typeof alert.ID === "string" &&
+      typeof alert.Type === "string" &&
+      typeof alert.Message === "string" &&
+      typeof alert.Timestamp === "string";
+
+    if (isValid) {
+      processedFeed.push({
+        ...alert,
+        priorityScore: calculateRelevance(alert, currentMs),
+      });
+    } else {
+      logWarn("service", "Invalid alert omitted from feed".slice(0, 48));
+    }
+  }
+
+  // Sort descending by highest score
+  return processedFeed.sort((a, b) => b.priorityScore - a.priorityScore);
+}
+
+// ---------------------------------------------------------
+// Route Handlers
+// ---------------------------------------------------------
 
 app.get("/notifications", async (req, res) => {
   try {
-    await logInfo("handler", "incoming GET /notifications");
-    await logInfo("service", "fetching notifications from API");
+    await logInfo("handler", "GET /notifications request received".slice(0, 48));
+    await logInfo("service", "Requesting external alerts via API".slice(0, 48));
 
-    const { data } = await axios.get(`${BASE}/notifications`, {
-      headers: authHeaders(),
+    const { data } = await axios.get(`${BASE_URL}/notifications`, {
+      headers: getAuthHeader(),
     });
 
-    const raw = data.notifications ?? [];
+    const unparsedAlerts = data.notifications || [];
 
-    if (raw.length === 0) {
-      await logWarn("service", "no notifications returned");
+    if (unparsedAlerts.length === 0) {
+      await logWarn("service", "API returned an empty alert array".slice(0, 48));
       return res.status(200).json({
-        success:              true,
-        totalNotifications:   0,
-        priorityInbox:        [],
+        success: true,
+        totalNotifications: 0,
+        priorityInbox: [],
       });
     }
 
-    await logDebug("service", `fetched:${raw.length} notifications`);
+    await logDebug("service", `Evaluating ${unparsedAlerts.length} items`.slice(0, 48));
 
-    // Validate — drop records missing required fields
-    const valid = raw.filter((n) => {
-      const ok = typeof n.ID        === "string"
-              && typeof n.Type      === "string"
-              && typeof n.Message   === "string"
-              && typeof n.Timestamp === "string";
-      if (!ok) logWarn("service", "bad record skipped");
-      return ok;
-    });
-
-    await logInfo("service", "scoring notifications");
-    const priorityInbox = buildPriorityInbox(valid);
-    await logInfo("service", "priority inbox built");
-    await logInfo("handler", "response sent");
+    const priorityInbox = generateRankedFeed(unparsedAlerts);
+    
+    await logInfo("service", "Feed successfully ranked and sorted".slice(0, 48));
+    await logInfo("handler", "Transmitting final payload to client".slice(0, 48));
 
     return res.status(200).json({
-      success:            true,
+      success: true,
       totalNotifications: priorityInbox.length,
       priorityInbox,
     });
 
-  } catch (err) {
-    await logFatal("handler", `/notifications err:${err.message}`.slice(0, 48));
-    return res.status(500).json({ success: false, error: err.message });
+  } catch (error) {
+    const errorMsg = `/notifications fail: ${error.message}`;
+    await logFatal("handler", errorMsg.slice(0, 48));
+    return res.status(500).json({ success: false, error: error.message });
   }
 });
 
 app.get("/", (req, res) => {
-  res.json({ status: "ok", routes: ["/notifications"] });
+  res.json({ status: "operational", routes: ["/notifications"] });
 });
 
-// ── START ──────────────────────────────────────────────────
+// ---------------------------------------------------------
+// Server Initialization
+// ---------------------------------------------------------
 
-authenticate()
+establishConnection()
   .then(() => {
     app.listen(PORT, () => {
-      console.log(`✅  Notification Priority Inbox on port ${PORT}`);
-      console.log(`    GET http://localhost:${PORT}/notifications`);
+      console.log(`✅ Priority Inbox running on port ${PORT}`);
+      console.log(`👉 GET http://localhost:${PORT}/notifications`);
     });
   })
-  .catch((err) => {
-    console.error("❌  Auth failed:", err.response?.data || err.message);
+  .catch((error) => {
+    console.error("❌ Authentication failure:", error.response?.data || error.message);
     process.exit(1);
   });
